@@ -25,7 +25,13 @@ install_for_shell() {
     case "$shell" in
         zsh)
             src="$REPO_DIR/zsh/wpptrans.zsh"
-            rc_file="$HOME/.zshrc"
+            # Respeita ZDOTDIR se definido (ex: HyDE usa ~/.config/zsh/)
+            local zdotdir="${ZDOTDIR:-$HOME}"
+            if [[ -f "$zdotdir/user.zsh" ]]; then
+                rc_file="$zdotdir/user.zsh"
+            else
+                rc_file="$zdotdir/.zshrc"
+            fi
             line="source \"$src\""
             ;;
         bash)
