@@ -33,7 +33,7 @@ _wpptrans_run() {
     fi
 
     echo "--- Transcrição ---"
-    whisper-cli -m "$model_path" -f "$tmp_wav" --no-prints -nt 2>/dev/null
+    whisper-cli -m "$model_path" -f "$tmp_wav" -l pt --no-prints -nt 2>/dev/null
     local exit_code=$?
     echo "-------------------"
 
