@@ -1,20 +1,25 @@
 # Whisper WhatsApp Audio (wpptrans)
 
-Scripts para transcrever áudios do WhatsApp (geralmente `.ogg`/Opus) usando **whisper.cpp** (`whisper-cli`) + **ffmpeg**.
+Transcreve áudios do WhatsApp (geralmente `.ogg`/Opus) usando **whisper.cpp** (`whisper-cli`) + **ffmpeg**, renderiza bonito no terminal e — opcionalmente — gera **resumo, tarefas, resposta provável e pontos-chave** via **Gemini**.
 
 O foco aqui é fluxo rápido:
-- colou/arrastou o arquivo → transcreveu no terminal
-- opção de apagar o WAV temporário
+- colou/arrastou o arquivo → transcreveu no terminal, em parágrafo legível e com painel
+- transcrição em **batch** (vários áudios de uma vez)
+- **análise por IA** (Gemini) logo após a transcrição
 - opção de apagar o áudio original (com guarda)
+
+> A versão turbinada (painel, batch, IA) vive em `wpptrans.py` e é exposta pelas funções **fish**. As variantes `bash`/`zsh` ainda existem com o comportamento básico antigo.
 
 ---
 
 ## Requisitos
 
 ### Dependências
-- `ffmpeg`
-- `whisper-cli` (whisper.cpp)
-- `python` (usado só para decodificar `file:///...%20...` de forma robusta)
+- `ffmpeg` (inclui `ffprobe`)
+- `whisper-cli` (whisper.cpp; recomendado o build CUDA)
+- `python3` (núcleo `wpptrans.py`)
+- `gemini` CLI autenticado — opcional, só para a camada de IA (`gemini --skip-trust -p ...`)
+- `bat` — opcional, renderiza o markdown da análise com cor
 
 ### Modelo (ggml)
 O modelo precisa estar em:
@@ -72,14 +77,46 @@ Também funciona colando do navegador (URL `file://` com `%20`):
 wpptrans "file:///home/user/Downloads/WhatsApp%20Audio%202026-02-13%20at%2012.00.58%20PM.ogg"
 ```
 
-Trocar modelo (último argumento):
+Por padrão a transcrição já vem seguida da análise completa do Gemini
+(resumo + tarefas + resposta provável + pontos-chave).
+
+### Modos de IA (qual análise mostrar)
+
+Passe uma palavra de **modo** em qualquer posição:
+
+| Modo | Mostra |
+|---|---|
+| `resume` / `resumo` | só o resumo |
+| `tarefas` / `tasks` | só a checklist de tarefas |
+| `reply` / `resposta` | só o rascunho de resposta |
+| `bullet` / `pontos` | só os pontos-chave |
+| `all` (padrão) | tudo |
+| `raw` / `texto` | só a transcrição, sem IA |
+
 ```bash
-wpptrans "/home/user/Downloads/audio.ogg" base
+wpptrans "/home/user/Downloads/audio.ogg" resume      # transcrição + só resumo
+wpptrans "/home/user/Downloads/audio.ogg" raw         # só transcrição, sem Gemini
 ```
 
-Modelos suportados:
-`tiny | base | small | medium | large`  
-Default: `small`
+### Batch (vários áudios)
+```bash
+wpptrans_batch          # transcreve todos os .ogg de ~/Downloads
+wpptrans_batch 6        # só os 6 mais recentes
+wpptrans_batch 4 resume # 4 mais recentes, mostrando só o resumo
+```
+
+### Modelos
+```bash
+wpptrans "/home/user/Downloads/audio.ogg" small        # trocar modelo whisper
+wpptrans "/home/user/Downloads/audio.ogg" resume small # modo + modelo juntos
+```
+
+Suportados: `tiny | base | small | medium | large | large-v3-turbo`  
+Default: `large-v3-turbo`. Modo e modelo podem vir em qualquer ordem.
+
+Variáveis de ambiente:
+- `WPPTRANS_GEMINI_MODEL` — força um modelo Gemini específico
+- `NO_COLOR` — desliga as cores
 
 ---
 
