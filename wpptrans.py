@@ -39,6 +39,12 @@ AUDIO_EXTS = {".ogg", ".opus", ".m4a", ".mp3", ".wav", ".aac", ".flac"}
 
 KNOWN_MODELS = {"tiny", "base", "small", "medium", "large", "large-v3-turbo"}
 
+# Largest → smallest. Used to walk down when the preferred model doesn't fit in VRAM.
+MODEL_FALLBACK_CHAIN = ["large", "large-v3-turbo", "medium", "small", "base", "tiny"]
+
+# MiB of VRAM to reserve on top of the model file size (CUDA context + KV cache + activations).
+VRAM_OVERHEAD_MIB = 500
+
 # mode keyword -> canonical section
 MODE_ALIASES = {
     "resume": "summary", "resumo": "summary", "summary": "summary",
@@ -100,6 +106,72 @@ def decode_path(raw: str) -> str:
 
 def model_path(model: str) -> Path:
     return MODELS_DIR / f"ggml-{model}.bin"
+
+
+def vram_free_mib() -> int | None:
+    """Free VRAM (MiB) on GPU 0. Returns None when no NVIDIA GPU is available
+    or the query fails — caller should skip the VRAM check in that case."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    line = out.stdout.strip().splitlines()[0].strip() if out.stdout.strip() else ""
+    try:
+        return int(line)
+    except ValueError:
+        return None
+
+
+def model_size_mib(model: str) -> int | None:
+    mp = model_path(model)
+    if not mp.is_file():
+        return None
+    return mp.stat().st_size // (1024 * 1024)
+
+
+def pick_model(preferred: str) -> str:
+    """Return the preferred whisper model if it fits in free VRAM; otherwise
+    the largest locally-installed smaller model that fits. Falls back to the
+    preferred model when there is no GPU info, the user opted out, or nothing
+    smaller is installed — letting whisper-cli surface its own error."""
+    if os.environ.get("WPPTRANS_NO_VRAM_CHECK"):
+        return preferred
+    free = vram_free_mib()
+    if free is None:
+        return preferred
+
+    def fits(m: str) -> bool:
+        size = model_size_mib(m)
+        return size is not None and size + VRAM_OVERHEAD_MIB <= free
+
+    if fits(preferred):
+        return preferred
+
+    if preferred in MODEL_FALLBACK_CHAIN:
+        candidates = MODEL_FALLBACK_CHAIN[MODEL_FALLBACK_CHAIN.index(preferred) + 1:]
+    else:
+        candidates = MODEL_FALLBACK_CHAIN
+
+    for m in candidates:
+        if fits(m):
+            preferred_size = model_size_mib(preferred)
+            preferred_label = (
+                f"{preferred} (~{preferred_size} MiB)" if preferred_size is not None
+                else preferred
+            )
+            eprint(paint(
+                f"  ⚠ VRAM insuficiente para {preferred_label}: só "
+                f"{free} MiB livres — usando '{m}'", C.yellow
+            ))
+            return m
+
+    return preferred
 
 
 def audio_duration(path: str) -> str:
@@ -191,25 +263,79 @@ def render_markdown(md: str) -> None:
 
 
 # ─── gemini ──────────────────────────────────────────────────────────────────
-def build_prompt(sections: list[str], text: str) -> str:
+_SECTION_PROMPTS_SINGLE = {
+    "summary": "Resuma em 1 a 3 frases.",
+    "tasks": "Liste em checklist (- [ ]) as tarefas/pendências/compromissos. Se não houver, escreva '- (nenhuma)'.",
+    "reply": "Escreva um rascunho curto e natural de resposta que eu poderia mandar de volta no WhatsApp.",
+    "keypoints": "Bullets com os pontos importantes, nomes, datas e valores mencionados.",
+}
+
+_SECTION_PROMPTS_BATCH = {
+    "summary": (
+        "Para CADA áudio, escreva uma linha no formato "
+        "`- [Áudio N — nome]: <1 frase concreta>`. "
+        "Cubra todos os áudios na ordem. Nada de frase guarda-chuva genérica "
+        "tipo 'os áudios tratam de diversos assuntos'."
+    ),
+    "tasks": (
+        "Checklist consolidado de TODAS as tarefas/pendências/compromissos. "
+        "Cada item no formato `- [ ] <ação> — [Áudio N]`. "
+        "Inclua prazos, nomes e valores quando mencionados. "
+        "Se nenhum áudio tiver tarefa, escreva `- (nenhuma)`."
+    ),
+    "reply": (
+        "Para cada áudio que pede ou espera resposta, escreva um rascunho separado "
+        "no formato `**[Áudio N — nome]**` seguido do texto da resposta em uma "
+        "linha em branco. Pule áudios que não pedem resposta."
+    ),
+    "keypoints": (
+        "Bullets com TODOS os fatos concretos extraíveis: nomes próprios, datas, "
+        "horários, locais, valores monetários, decisões, números, prazos. "
+        "Cada bullet no formato `- <fato> — [Áudio N]`. "
+        "Não resuma — liste. Prefira granularidade alta."
+    ),
+}
+
+
+def build_prompt(sections: list[str], jobs: list["Job"]) -> str:
+    batch = len(jobs) > 1
+    prompts = _SECTION_PROMPTS_BATCH if batch else _SECTION_PROMPTS_SINGLE
     wanted = "\n".join(
-        f"## {SECTION_TITLES[s]}\n" + {
-            "summary": "Resuma o áudio em 1 a 3 frases.",
-            "tasks": "Liste em checklist (- [ ]) as tarefas/pendências/compromissos. Se não houver, escreva '- (nenhuma)'.",
-            "reply": "Escreva um rascunho curto e natural de resposta que eu poderia mandar de volta no WhatsApp.",
-            "keypoints": "Bullets com os pontos importantes, nomes, datas e valores mencionados.",
-        }[s]
-        for s in sections
+        f"## {SECTION_TITLES[s]}\n{prompts[s]}" for s in sections
     )
-    return (
-        "Você recebe a transcrição de um áudio de WhatsApp (pode ter erros de "
-        "transcrição). Responda em português do Brasil, em markdown, gerando "
-        "EXATAMENTE as seções abaixo (com esses títulos ##), nada além disso. "
-        "Seja conciso.\n\n"
-        f"{wanted}\n\n"
-        "---\nTranscrição:\n"
-        f"{text}\n"
-    )
+    if not batch:
+        intro = (
+            "Você recebe a transcrição de um áudio de WhatsApp (pode ter erros de "
+            "transcrição). Responda em português do Brasil, em markdown, gerando "
+            "EXATAMENTE as seções abaixo (com esses títulos ##), nada além disso. "
+            "Seja conciso."
+        )
+        body = f"---\nTranscrição:\n{jobs[0].text}\n"
+    else:
+        intro = (
+            f"Você recebe as transcrições de {len(jobs)} áudios de WhatsApp em "
+            "sequência (podem ter erros). Gere EXATAMENTE as seções abaixo (com "
+            "esses títulos ##), nada além disso, em português do Brasil em "
+            "markdown.\n\n"
+            "Regras OBRIGATÓRIAS:\n"
+            "1. Cubra TODOS os áudios — nenhum pode ser ignorado.\n"
+            "2. Toda afirmação, tarefa, ponto ou rascunho deve identificar a "
+            "origem com a tag `[Áudio N]` (use a numeração das transcrições "
+            "abaixo).\n"
+            "3. Seja ESPECÍFICO e CONCRETO. Cite nomes, datas, horários, valores, "
+            "decisões literais. Proibido escrever frases genéricas tipo 'discute "
+            "vários assuntos', 'fala sobre diversos temas' ou 'aborda diferentes "
+            "pontos'.\n"
+            "4. Prefira MAIS detalhe a menos. Não tente comprimir; granularidade "
+            "é o objetivo aqui.\n"
+            "5. Não invente nada que não esteja na transcrição."
+        )
+        chunks = "\n\n".join(
+            f"### Áudio {i} — {job.name} ({job.duration})\n{job.text}"
+            for i, job in enumerate(jobs, 1)
+        )
+        body = f"---\nTranscrições:\n{chunks}\n"
+    return f"{intro}\n\n{wanted}\n\n{body}"
 
 
 def run_gemini(prompt: str) -> str | None:
@@ -248,10 +374,18 @@ class Options:
     rm: bool = False
 
 
-def process_file(src: str, opts: Options, idx: int = 0, total: int = 1) -> bool:
+@dataclass
+class Job:
+    src: str
+    name: str
+    duration: str
+    text: str
+
+
+def transcribe_one(src: str, opts: Options, idx: int = 0, total: int = 1) -> Job | None:
     if not os.path.isfile(src):
         eprint(paint(f"Erro: arquivo não encontrado: {src}", C.red))
-        return False
+        return None
 
     counter = f"[{idx}/{total}] " if total > 1 else ""
     name = os.path.basename(src)
@@ -260,36 +394,53 @@ def process_file(src: str, opts: Options, idx: int = 0, total: int = 1) -> bool:
 
     wav = to_wav(src)
     if wav is None:
-        return False
+        return None
     try:
         dur = audio_duration(src)
-        eprint(paint(f"  transcrevendo ({opts.model}, {dur})…", C.dim))
-        text = transcribe(wav, opts.model)
+        model = pick_model(opts.model)
+        eprint(paint(f"  transcrevendo ({model}, {dur})…", C.dim))
+        text = transcribe(wav, model)
     finally:
         os.remove(wav)
 
     if text is None:
-        return False
+        return None
 
-    panel(f"Transcrição · {dur} · {opts.model}", text, border=C.cyan)
+    panel(f"Transcrição · {dur} · {model}", text, border=C.cyan)
+    return Job(src=src, name=name, duration=dur, text=text)
 
-    if opts.ai and text.strip():
+
+def analyze_all(jobs: list[Job], opts: Options) -> None:
+    usable = [j for j in jobs if j.text.strip()]
+    if not usable:
+        return
+    if len(usable) == 1:
         eprint(paint("  analisando com Gemini…", C.dim))
-        result = run_gemini(build_prompt(opts.sections, text))
-        if result:
-            print()
-            print(paint("── Análise (Gemini) ──", C.green, C.bold))
-            render_markdown(result)
+    else:
+        eprint(paint(
+            f"  analisando {len(usable)} transcrições juntas com Gemini…", C.dim
+        ))
+    result = run_gemini(build_prompt(opts.sections, usable))
+    if not result:
+        return
+    print()
+    if len(usable) == 1:
+        print(paint("── Análise (Gemini) ──", C.green, C.bold))
+    else:
+        print(paint(
+            f"── Análise consolidada · {len(usable)} áudios ──",
+            C.green, C.bold,
+        ))
+    render_markdown(result)
 
-    if opts.rm:
-        real = os.path.realpath(src)
-        if os.path.commonpath([real, str(DOWNLOADS.resolve())]) == str(DOWNLOADS.resolve()):
-            os.remove(src)
-            print(paint(f"(arquivo removido: {src})", C.dim))
-        else:
-            eprint(paint("Aviso: remoção permitida apenas em ~/Downloads/ — arquivo mantido.", C.yellow))
 
-    return True
+def cleanup(src: str) -> None:
+    real = os.path.realpath(src)
+    if os.path.commonpath([real, str(DOWNLOADS.resolve())]) == str(DOWNLOADS.resolve()):
+        os.remove(src)
+        print(paint(f"(arquivo removido: {src})", C.dim))
+    else:
+        eprint(paint(f"Aviso: remoção permitida apenas em ~/Downloads/ — mantido: {src}", C.yellow))
 
 
 # ─── arg parsing ─────────────────────────────────────────────────────────────
@@ -374,11 +525,28 @@ def main(argv: list[str]) -> int:
     if opts is None:
         return 1
     total = len(opts.files)
-    ok = True
+    jobs: list[Job] = []
+    failed = 0
+
+    # Phase 1 — transcribe every file before touching Gemini.
     for i, f in enumerate(opts.files, 1):
-        if not process_file(f, opts, i, total):
-            ok = False
-    return 0 if ok else 1
+        job = transcribe_one(f, opts, i, total)
+        if job is None:
+            failed += 1
+        else:
+            jobs.append(job)
+
+    # Phase 2 — single Gemini call covering all transcriptions as one context.
+    if opts.ai and jobs:
+        analyze_all(jobs, opts)
+
+    # Phase 3 — only remove files that made it through transcription.
+    if opts.rm and jobs:
+        print()
+        for job in jobs:
+            cleanup(job.src)
+
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
