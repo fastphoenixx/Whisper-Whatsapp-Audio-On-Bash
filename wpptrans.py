@@ -135,23 +135,36 @@ def model_size_mib(model: str) -> int | None:
     return mp.stat().st_size // (1024 * 1024)
 
 
-def pick_model(preferred: str) -> str:
-    """Return the preferred whisper model if it fits in free VRAM; otherwise
-    the largest locally-installed smaller model that fits. Falls back to the
-    preferred model when there is no GPU info, the user opted out, or nothing
-    smaller is installed — letting whisper-cli surface its own error."""
+def pick_model(preferred: str) -> tuple[str, bool]:
+    """Decide which whisper model to use and whether to run it on the GPU.
+    Returns (model, use_gpu). Strategy:
+
+    1. WPPTRANS_FORCE_CPU=1 → run preferred on CPU.
+    2. WPPTRANS_NO_VRAM_CHECK=1, no NVIDIA GPU, or query failure → preferred on GPU.
+    3. preferred fits in free VRAM → preferred on GPU.
+    4. largest locally-installed smaller model fits → that model on GPU.
+    5. nothing fits → preferred on CPU (slower but does not crash)."""
+    if os.environ.get("WPPTRANS_FORCE_CPU"):
+        eprint(paint("  ⚠ WPPTRANS_FORCE_CPU definido — rodando na CPU", C.yellow))
+        return preferred, False
     if os.environ.get("WPPTRANS_NO_VRAM_CHECK"):
-        return preferred
+        return preferred, True
     free = vram_free_mib()
     if free is None:
-        return preferred
+        return preferred, True
 
     def fits(m: str) -> bool:
         size = model_size_mib(m)
         return size is not None and size + VRAM_OVERHEAD_MIB <= free
 
     if fits(preferred):
-        return preferred
+        return preferred, True
+
+    preferred_size = model_size_mib(preferred)
+    preferred_label = (
+        f"{preferred} (~{preferred_size} MiB)" if preferred_size is not None
+        else preferred
+    )
 
     if preferred in MODEL_FALLBACK_CHAIN:
         candidates = MODEL_FALLBACK_CHAIN[MODEL_FALLBACK_CHAIN.index(preferred) + 1:]
@@ -160,18 +173,17 @@ def pick_model(preferred: str) -> str:
 
     for m in candidates:
         if fits(m):
-            preferred_size = model_size_mib(preferred)
-            preferred_label = (
-                f"{preferred} (~{preferred_size} MiB)" if preferred_size is not None
-                else preferred
-            )
             eprint(paint(
                 f"  ⚠ VRAM insuficiente para {preferred_label}: só "
-                f"{free} MiB livres — usando '{m}'", C.yellow
+                f"{free} MiB livres — usando '{m}' na GPU", C.yellow
             ))
-            return m
+            return m, True
 
-    return preferred
+    eprint(paint(
+        f"  ⚠ VRAM insuficiente para {preferred_label} e nenhum modelo menor "
+        f"instalado cabe em {free} MiB — caindo pra CPU ({preferred})", C.yellow
+    ))
+    return preferred, False
 
 
 def audio_duration(path: str) -> str:
@@ -212,16 +224,16 @@ def reflow(raw: str) -> str:
     return " ".join(text.split())
 
 
-def transcribe(wav: str, model: str) -> str | None:
+def transcribe(wav: str, model: str, use_gpu: bool = True) -> str | None:
     mp = model_path(model)
     if not mp.is_file():
         eprint(paint(f"Erro: modelo '{model}' não encontrado em {mp}", C.red))
         return None
-    proc = subprocess.run(
-        ["whisper-cli", "-m", str(mp), "-f", wav, "-l", "pt",
-         "--no-prints", "-nt"],
-        capture_output=True, text=True,
-    )
+    cmd = ["whisper-cli", "-m", str(mp), "-f", wav, "-l", "pt",
+           "--no-prints", "-nt"]
+    if not use_gpu:
+        cmd.append("-ng")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         eprint(paint("Erro: whisper-cli falhou", C.red))
         if proc.stderr.strip():
@@ -397,16 +409,17 @@ def transcribe_one(src: str, opts: Options, idx: int = 0, total: int = 1) -> Job
         return None
     try:
         dur = audio_duration(src)
-        model = pick_model(opts.model)
-        eprint(paint(f"  transcrevendo ({model}, {dur})…", C.dim))
-        text = transcribe(wav, model)
+        model, use_gpu = pick_model(opts.model)
+        device = "GPU" if use_gpu else "CPU"
+        eprint(paint(f"  transcrevendo ({model}/{device}, {dur})…", C.dim))
+        text = transcribe(wav, model, use_gpu=use_gpu)
     finally:
         os.remove(wav)
 
     if text is None:
         return None
 
-    panel(f"Transcrição · {dur} · {model}", text, border=C.cyan)
+    panel(f"Transcrição · {dur} · {model}/{device}", text, border=C.cyan)
     return Job(src=src, name=name, duration=dur, text=text)
 
 
